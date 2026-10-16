@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# adb_performance_tweaks_advanced.sh
+# Apply safe, idempotent performance/balanced/battery tuning to Android devices via adb.
+#
+# Usage:
+#   ./adb_performance_tweaks_advanced.sh [--device <serial>] [--mode performance|balanced|battery] [--dry-run] [--yes]
+#
+# Examples:
+#   ./adb_performance_tweaks_advanced.sh --mode performance
+#   ./adb_performance_tweaks_advanced.sh --device ZX1G2ABC --mode balanced --dry-run
+#   ./adb_performance_tweaks_advanced.sh --mode battery --yes
+#
+# Notes & safety:
+#  - Requires adb in PATH and USB debugging enabled on the device.
+#  - Some settings are OEM/ROM-dependent and may be ignored silently.
+#  - Root-only operations are attempted only if the device is rooted; otherwise skipped.
+#  - This script avoids destructive operations (pm clear, uninstall) unless you modify it.
+#  - Use --dry-run to preview the commands that would be executed.
+#  - Use --yes to skip confirmation prompts.
+set -euo pipefail
+
+# Defaults
+ADB="${ADB:-adb}"
+DEVICE=""
+MODE="performance"   # performance | balanced | battery
+DRY_RUN=0
+ASSUME_YES=0
+PREWARM_PKGS=()
+# You can add package names to PREWARM_PKGS to "warm" them after applying changes:
+# PREWARM_PKGS=("com.google.android.gms" "com.android.systemui")
+
+# Helper: print usage
+usage() {
+  cat <<EOF
+Usage: $0 [--device <serial>] [--mode performance|balanced|battery] [--dry-run] [--yes] [--prewarm pkg1,pkg2]
+
+Options:
+  --device <serial>   Use adb -s <serial> (optional)
+  --mode <mode>       performance (default) | balanced | battery
+  --dry-run           Show commands, don't execute
+  --yes               Skip confirmation prompts
+  --prewarm pkg1,pkg2 Comma-separated packages to pre-launch (optional)
+  -h, --help          Show this help
+EOF
+  exit 1
+}
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --device) DEVICE="$2"; shift 2 ;;
+    --mode) MODE="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --yes) ASSUME_YES=1; shift ;;
+    --prewarm) IFS=',' read -r -a PREWARM_PKGS <<< "$2"; shift 2 ;;
+    -h|--help) usage ;;
+    *) echo "Unknown arg: $1"; usage ;;
+  esac
+done
+
+# Validate mode
+if [[ ! "$MODE" =~ ^(performance|balanced|battery)$ ]]; then
+  echo "Invalid mode: $MODE"
+  usage
+fi
+
+# Build adb command prefix
+ADB_CMD="$ADB"
+if [[ -n "$DEVICE" ]]; then
+  ADB_CMD="$ADB -s $DEVICE"
+fi
+
+# Dry-run runner
+run() {
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[DRY-RUN] $*"
+  else
+    echo "+ $*"
+    $*
+  fi
+}
+
+# Run shell command via adb
+shrun() {
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[DRY-RUN] $ADB_CMD shell $*"
+  else
+    set +e
+    $ADB_CMD shell "$@"
+    RC=$?
+    set -e
+    return $RC
+  fi
+}
+
+# Preflight checks
+command -v "$ADB" >/dev/null 2>&1 || { echo "adb not found in PATH."; exit 2; }
+
+# Check connected devices
+DEVICES_RAW=$($ADB devices)
+DEV_COUNT=$(echo "$DEVICES_RAW" | sed '1d' | sed '/^\s*$/d' | wc -l)
+if [[ "$DEV_COUNT" -lt 1 ]]; then
+  echo "No connected devices found. Run 'adb devices' and enable USB debugging."
+  exit 2
+fi
+
+if [[ -n "$DEVICE" ]]; then
+  if ! echo "$DEVICES_RAW" | grep -q "^$DEVICE"; then
+    echo "Device serial '$DEVICE' not listed by adb. Connected devices:"
+    echo "$DEVICES_RAW"
+    exit 2
+  fi
+fi
+
+# Show plan summary and ask for confirmation
+echo "Plan: apply settings for mode='$MODE' to device '${DEVICE:-<default device>}'"
+echo "Dry-run: ${DRY_RUN:-0}"
+if [[ $ASSUME_YES -ne 1 ]]; then
+  read -r -p "Proceed? (y/N) " RESP
+  if [[ ! "$RESP" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+    echo "Aborted."
+    exit 0
+  fi
+fi
+
+# Detect root (best-effort): runs 'id' and look for uid=0
+IS_ROOT=0
+if shrun id 2>/dev/null | grep -q "uid=0"; then
+  IS_ROOT=1
+fi
+
+# Device info
+MODEL=$(shrun getprop ro.product.model | tr -d '\r' || echo "unknown")
+ANDROID_VER=$(shrun getprop ro.build.version.release | tr -d '\r' || echo "unknown")
+echo "Device model: $MODEL, Android: $ANDROID_VER, rooted:$IS_ROOT"
+
+# Mode-specific parameter mapping
+case "$MODE" in
+  performance)
+    # animation_scale: smaller -> faster
+    WINDOW_ANIM=0.5
+    TRANSITION_ANIM=0.5
+    ANIMATOR=0.5
+    SCREEN_TIMEOUT_MS=120000      # 2 minutes
+    BRIGHTNESS_MODE=0             # manual
+    BRIGHTNESS=230                # 0-255 (~90%)
+    LOW_POWER=0                   # turn off battery saver
+    BACKGROUND_PROCESS_LIMIT=-1   # -1 = unlimited
+    STAY_ON_WHILE_PLUGGED_IN=3    # 1=AC,2=USB,3=AC+USB
+    DOZE_ENABLED=0                # disable aggressive doze (best-effort)
+    ;;
+  balanced)
+    WINDOW_ANIM=0.75
+    TRANSITION_ANIM=0.75
+    ANIMATOR=0.75
+    SCREEN_TIMEOUT_MS=60000       # 1 minute
+    BRIGHTNESS_MODE=1             # auto
+    BRIGHTNESS=180                # ~70%
+    LOW_POWER=0
+    BACKGROUND_PROCESS_LIMIT=10
+    STAY_ON_WHILE_PLUGGED_IN=3
+    DOZE_ENABLED=1
+    ;;
+  battery)
+    WINDOW_ANIM=1.0
+    TRANSITION_ANIM=1.0
+    ANIMATOR=1.0
+    SCREEN_TIMEOUT_MS=30000       # 30 seconds
+    BRIGHTNESS_MODE=1             # auto
+    BRIGHTNESS=120                # ~45%
+    LOW_POWER=1                   # enable battery saver
+    BACKGROUND_PROCESS_LIMIT=3
+    STAY_ON_WHILE_PLUGGED_IN=0
+    DOZE_ENABLED=1
+    ;;
+esac
+
+echo "Applying settings..."
+
+# 1) Animation scales
+echo "-> Setting animation scales to $WINDOW_ANIM / $TRANSITION_ANIM / $ANIMATOR"
+run $ADB_CMD shell settings put global window_animation_scale "$WINDOW_ANIM" || true
+run $ADB_CMD shell settings put global transition_animation_scale "$TRANSITION_ANIM" || true
+run $ADB_CMD shell settings put global animator_duration_scale "$ANIMATOR" || true
+
+# 2) Screen timeout
+echo "-> Setting screen timeout to ${SCREEN_TIMEOUT_MS} ms"
+run $ADB_CMD shell settings put system screen_off_timeout "$SCREEN_TIMEOUT_MS" || true
+
+# 3) Brightness mode and level
+echo "-> Setting brightness mode ($BRIGHTNESS_MODE) and brightness ($BRIGHTNESS)"
+run $ADB_CMD shell settings put system screen_brightness_mode "$BRIGHTNESS_MODE" || true
+run $ADB_CMD shell settings put system screen_brightness "$BRIGHTNESS" || true
+
+# 4) Battery saver (low_power)
+echo "-> Setting low_power = $LOW_POWER (0=off,1=on)"
+# Some devices expose via Global, others via Settings.Secure - try Global first
+run $ADB_CMD shell settings put global low_power "$LOW_POWER" || true
+
+# 5) stay_on_while_plugged_in
+echo "-> Setting stay_on_while_plugged_in = $STAY_ON_WHILE_PLUGGED_IN"
+run $ADB_CMD shell settings put global stay_on_while_plugged_in "$STAY_ON_WHILE_PLUGGED_IN" || true
+
+# 6) Background process limit (developer option)
+echo "-> Setting background_process_limit = $BACKGROUND_PROCESS_LIMIT"
+run $ADB_CMD shell settings put global background_process_limit "$BACKGROUND_PROCESS_LIMIT" || true
+
+# 7) Doze / App standby hint (best-effort)
+if [[ "$DOZE_ENABLED" -eq 0 ]]; then
+  echo "-> Attempting to relax Doze settings (best-effort)"
+  # Most devices do not allow toggling the full doze behavior via settings; attempt to whitelist important packages instead
+  # We won't globally disable Doze; instead we show instructions
+  echo "[INFO] Doze is left default; to whitelist a package for Doze: 'adb shell dumpsys deviceidle whitelist +<package>' (use carefully)"
+else
+  echo "-> Leaving Doze enabled (default)"
+fi
+
+# 8) Trim caches (non-root: pm trim-caches; root: drop_caches)
+echo "-> Attempting to free caches (non-destructive)"
+if [[ $IS_ROOT -eq 1 ]]; then
+  echo "Device is rooted: attempting drop_caches (may require kernel support)"
+  run $ADB_CMD shell sync || true
+  # Try writing to /proc/sys/vm/drop_caches if available
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[DRY-RUN] $ADB_CMD shell 'echo 3 > /proc/sys/vm/drop_caches'"
+  else
+    set +e
+    $ADB_CMD shell 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || echo "drop_caches not available / denied"
+    set -e
+  fi
+else
+  echo "Non-root device: using 'pm trim-caches 100M' (best-effort)"
+  run $ADB_CMD shell pm trim-caches 100M || true
+fi
+
+# 9) Attempt high-refresh-rate enabling (best-effort) - many OEMs do not expose via settings
+echo "-> Attempting to set high refresh rate (best-effort)"
+# Try known settings keys used on some devices; they may have no effect on many phones
+run $ADB_CMD shell settings put global peak_refresh_rate 90.0 || true
+run $ADB_CMD shell settings put global min_refresh_rate 90.0 || true
+# If above fails, user must change Motion Smoothness manually (Settings -> Display -> Motion smoothness)
+
+# 10) Optional: Pre-warm packages to reduce first-launch overhead
+if [[ ${#PREWARM_PKGS[@]} -gt 0 ]]; then
+  echo "-> Pre-warming packages: ${PREWARM_PKGS[*]}"
+  for pkg in "${PREWARM_PKGS[@]}"; do
+    echo "  - Prelaunch $pkg"
+    run $ADB_CMD shell monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 || true
+  done
+fi
+
+# 11) Optional: Toggle radios (not enabled by default)
+echo "-> NOTE: Wi-Fi / Bluetooth radio toggles not executed by default. Toggle manually or add commands."
+
+# 12) Final notes: show some values
+echo "-> Current animation scales:"
+shrun settings get global window_animation_scale || true
+shrun settings get global transition_animation_scale || true
+shrun settings get global animator_duration_scale || true
+
+echo "-> Current screen timeout and brightness:"
+shrun settings get system screen_off_timeout || true
+shrun settings get system screen_brightness_mode || true
+shrun settings get system screen_brightness || true
+
+echo "-> Background process limit:"
+shrun settings get global background_process_limit || true
+
+echo "-> low_power:"
+shrun settings get global low_power || true
+
+echo "Performance tweak pass complete."
+
+cat <<EOF
+
+IMPORTANT SAFETY NOTES
+- Some settings cannot be changed on all devices (OEM/ROM differences); failures are expected sometimes.
+- This script does NOT perform destructive operations. Commands like 'pm clear <pkg>' or uninstalling packages are intentionally omitted.
+- Root-only tweaks are only attempted if the device reports a root shell.
+- To revert some settings: animations -> set scales back to 1.0; screen brightness mode 1 = auto.
+- If you want the script to run automatically at boot or periodically, consider using a host-side agent (e.g., systemd service running this script) or an on-device helper (Termux + script) — both require additional setup.
+
+If you want:
+ - A revert/unapply mode to restore defaults
+ - Persistent schedule (cron/systemd) or integration with the Python self-healing agent I previously provided
+ - Additional device-specific tweaks (Samsung One UI keys, Pixel-specific keys)
+tell me which and I will extend the script.
+
+EOF
