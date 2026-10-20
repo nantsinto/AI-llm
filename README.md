@@ -330,4 +330,4 @@ EOF_FBS
 echo ""
 echo "DONE. Your bridge token:"
 grep BRIDGE_TOKEN .env
-echo "Next: nano ~/copilot/.env  (paste your ANTHROPIC_API_KEY), then: bash ~/copilot/start.sh"nano ~/copilot/.env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
+echo "Next: nano ~/copilot/.env  (paste your ANTHROPIC_API_KEY), then: bash ~/copilot/start.sh"nano ~/copilot/
